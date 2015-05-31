@@ -46,8 +46,10 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
      */
 
     var updateOp: Map[Long, Cancellable] = Map.empty[Long, Cancellable]
+    var persistOp: Map[Long, Cancellable] = Map.empty[Long, Cancellable]
+    var replicateOp: Map[Long, Cancellable] = Map.empty[Long, Cancellable]
 
-    var operations: Map[Long, (String, Option[String])] = Map.empty[Long, (String, Option[String])]
+    var operations: Map[Long, (String, Option[String], Boolean)] = Map.empty[Long, (String, Option[String], Boolean)]
 
     var operationRequester: Map[Long, ActorRef] = Map.empty[Long, ActorRef]
 
@@ -61,7 +63,14 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     // the current set of replicators
     var replicators = Set.empty[ActorRef]
 
+    var replicationSet = Set.empty[ActorRef]
+
     val persistence = context.system.actorOf(persistenceProps)
+
+    override val supervisorStrategy = OneForOneStrategy(10)
+    {
+        case _: Exception => SupervisorStrategy.restart
+    }
 
     // register self in a Arbiter
     arbiter ! Join
@@ -89,38 +98,71 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
         {
             acknowledgement(id)
         }
-        case _ =>
+        case Replicas(replicas) =>
+        {
+            (replicas - self).foreach{ replica =>
+                val replicator = context.system.actorOf(Replicator.props(replica))
+                secondaries += replica -> replicator
+                replicators += replicator
+            }
+        }
+        case Replicated(key, id) =>
+        {
+            replicationSet -= sender
+            println(s"replicated id: $id")
+            if(replicationSet.isEmpty && persistOp.get(id).map(_.isCancelled).getOrElse(false))
+            {
+                println("replication and persistent finished, can acknowledge")
+                replicateOp.get(id).map{ c => c.cancel(); println("replication timeout cancelled")}
+                operationRequester.get(id).map(_ ! OperationAck(id))
+                operationRequester -= id
+            }
+        }
+        case msg => println("Unknown message" + msg)
     }
 
     def acknowledgement(id: Long) =
     {
-        println("ackn id: " + id)
+        persistOp.get(id).map(_.cancel())
         updateOp.get(id).map{c =>
             c.cancel()
-            operationRequester.get(id).map( _ ! OperationAck(id))
-            operationRequester -= id
+            if(replicationSet.isEmpty)
+            {
+                operationRequester.get(id).map(_ ! OperationAck(id))
+                operationRequester -= id
+            }
             operations.get(id) match
             {
-                case Some((key, Some(v))) =>
+                case Some((key, Some(v), _)) =>
                     kv += key -> v
-                case Some((key, None)) =>
+                case Some((key, None, _)) =>
                     kv -= key
                 case None => println("Oooops, operations is empty!")
             }
+/*            operations -= id*/
         }
     }
 
     def opProcessing(id: Long, key: String, value: Option[String], requester: ActorRef) =
     {
         operationRequester += id -> requester
-        operations += id -> (key, value)
-        persistence ! Persist(key, value, id)
+        operations += id -> (key, value, false)
+        replicators.foreach{ replicator =>
+            replicator ! Replicate(key, value, id)
+            replicationSet += replicator
+        }
+        val persOp = context.system.scheduler.schedule(0 millis, 100 millis){persistence ! Persist(key, value, id)}
         val op = context.system.scheduler.scheduleOnce(1 second){
-            sender ! OperationFailed(id)
+            requester ! OperationFailed(id)
             updateOp -= id
+            persistOp -= id
             operations -= id
         }
+        if(replicators.nonEmpty){
+            replicateOp += id -> context.system.scheduler.scheduleOnce(1 second){requester ! OperationFailed(id)}
+        }
         updateOp += id -> op
+        persistOp += id -> persOp
     }
 
     /* TODO Behavior for the replica role. */
@@ -131,12 +173,15 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
         }
         case Snapshot(key, valueOpt, seq) =>
         {
-            if(seq < expectedSeq){
-                println(s" seq: $seq < exp: $expectedSeq")
+            if(seq < expectedSeq)
                 sender ! SnapshotAck(key, seq)
-            }
-            else if(seq == expectedSeq)
+            else if(seq == expectedSeq && seqToReplicator.get(seq).isEmpty)
             {
+                valueOpt match
+                {
+                    case Some(v) => kv += key -> v
+                    case None => kv -= key
+                }
                 seqToReplicator += seq -> sender
                 opProcessing(seq, key, valueOpt, self)
             }
@@ -147,7 +192,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
         }
         case OperationAck(id) =>
         {
-            operations.get(id).map{ case(k: String, v: Option[String]) => seqToReplicator.get(id).map(_ ! SnapshotAck(k, id))}
+            operations.get(id).map{ case(k: String, v: Option[String], _) => seqToReplicator.get(id).map(_ ! SnapshotAck(k, id))}
+            seqToReplicator -= id
             if(expectedSeq < id +1) expectedSeq += 1
         }
         case OperationFailed(id) =>
