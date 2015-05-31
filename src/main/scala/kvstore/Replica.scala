@@ -100,10 +100,40 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
         }
         case Replicas(replicas) =>
         {
-            (replicas - self).foreach{ replica =>
+
+            val secondariesReplicasSet: Set[ActorRef] = secondaries.toSet[(ActorRef, ActorRef)].map(v => v._1)
+            val replicasToUpdate = replicas diff secondariesReplicasSet
+            val replicasToRemove = secondariesReplicasSet diff replicas
+            val replicatorsToRemove = secondaries.filter(el => replicasToRemove.contains(el._1)).toSet[(ActorRef, ActorRef)].map(v => v._2)
+            replicasToRemove.foreach(_ ! PoisonPill)
+            replicatorsToRemove.foreach(_ ! PoisonPill)
+            replicationSet = replicationSet -- replicatorsToRemove
+            replicasToRemove.foreach(secondaries -= _)
+            replicatorsToRemove.foreach(replicators -= _)
+
+            /*if(replicas.size == 1 && replicas.head == self)
+            {
+                replicateOp.foreach{case (k, c) =>
+                    c.cancel()
+                    acknowledgement(k)
+                }
+            }*/
+
+            if(secondaries.size == 0 && (replicasToUpdate - self).isEmpty)
+            {
+               replicateOp.foreach{ case (k, c) =>
+                   c.cancel()
+                   acknowledgement(k)
+               }
+            }
+
+            (replicasToUpdate - self).foreach{ replica =>
                 val replicator = context.system.actorOf(Replicator.props(replica))
                 secondaries += replica -> replicator
                 replicators += replicator
+                kv foreach{ case (k, v) =>
+                    replicator ! Replicate(k, Some(v), 0L)
+                }
             }
         }
         case Replicated(key, id) =>
@@ -114,6 +144,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
             {
                 println("replication and persistent finished, can acknowledge")
                 replicateOp.get(id).map{ c => c.cancel(); println("replication timeout cancelled")}
+                replicateOp -= id
                 operationRequester.get(id).map(_ ! OperationAck(id))
                 operationRequester -= id
             }
@@ -123,6 +154,9 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
     def acknowledgement(id: Long) =
     {
+        println(s"ackn id: $id")
+        println(s"persistOp: ${persistOp.contains(id)}")
+        println(s"repl set size: ${replicationSet.size}")
         persistOp.get(id).map(_.cancel())
         updateOp.get(id).map{c =>
             c.cancel()
@@ -159,7 +193,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
             operations -= id
         }
         if(replicators.nonEmpty){
-            replicateOp += id -> context.system.scheduler.scheduleOnce(1 second){requester ! OperationFailed(id)}
+            replicateOp += id -> context.system.scheduler.scheduleOnce(1 second){println(s"replic timeot id: $id!");requester ! OperationFailed(id)}
         }
         updateOp += id -> op
         persistOp += id -> persOp
