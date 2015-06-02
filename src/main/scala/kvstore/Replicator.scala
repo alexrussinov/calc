@@ -48,7 +48,7 @@ class Replicator(val replica: ActorRef) extends Actor {
         {
             val snapshot = Snapshot(key, valueOpt, _seqCounter)
             acks += _seqCounter -> (sender, rep)
-            val op = context.system.scheduler.schedule(0 millis, 100 millis){replica ! snapshot}
+            val op = context.system.scheduler.schedule(100 millis, 100 millis){replica ! snapshot}
             seqToSnapOp +=_seqCounter -> op
         }
         case SnapshotAck(key, seq) =>

@@ -67,9 +67,9 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
     val persistence = context.system.actorOf(persistenceProps)
 
-    override val supervisorStrategy = OneForOneStrategy(10)
+    override val supervisorStrategy = OneForOneStrategy()
     {
-        case _: Exception => SupervisorStrategy.restart
+        case _: PersistenceException => SupervisorStrategy.restart
     }
 
     // register self in a Arbiter
