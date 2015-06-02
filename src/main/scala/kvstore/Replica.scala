@@ -9,6 +9,8 @@ import akka.pattern.{ask, pipe}
 import scala.concurrent.duration._
 import akka.util.Timeout
 
+import scala.util.Random
+
 object Replica {
 
     sealed trait Operation {
@@ -65,6 +67,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
     var replicationSet = Set.empty[ActorRef]
 
+    var repAckn: Map[ActorRef, Set[Long]] = Map.empty[ActorRef, Set[Long]]
+
     val persistence = context.system.actorOf(persistenceProps)
 
     override val supervisorStrategy = OneForOneStrategy()
@@ -107,7 +111,9 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
             val replicatorsToRemove = secondaries.filter(el => replicasToRemove.contains(el._1)).toSet[(ActorRef, ActorRef)].map(v => v._2)
             replicasToRemove.foreach(_ ! PoisonPill)
             replicatorsToRemove.foreach(_ ! PoisonPill)
-            replicationSet = replicationSet -- replicatorsToRemove
+//            replicationSet = replicationSet -- replicatorsToRemove
+            replicatorsToRemove.foreach(replicator => repAckn -= replicator)
+
             replicasToRemove.foreach(secondaries -= _)
             replicatorsToRemove.foreach(replicators -= _)
 
@@ -132,35 +138,40 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
                 secondaries += replica -> replicator
                 replicators += replicator
                 kv foreach{ case (k, v) =>
-                    replicator ! Replicate(k, Some(v), 0L)
+                    val doomyId = Random.nextLong * 1000L
+                    replicator ! Replicate(k, Some(v), doomyId)
+                        repAckn = addToReplAckn(repAckn, replicator, doomyId)
                 }
             }
         }
         case Replicated(key, id) =>
         {
-            replicationSet -= sender
+            repAckn = rmFromReplAckn(repAckn, sender, id)
             println(s"replicated id: $id")
-            if(replicationSet.isEmpty && persistOp.get(id).map(_.isCancelled).getOrElse(false))
+            if(repAckn.isEmpty)
             {
                 println("replication and persistent finished, can acknowledge")
                 replicateOp.get(id).map{ c => c.cancel(); println("replication timeout cancelled")}
                 replicateOp -= id
-                operationRequester.get(id).map(_ ! OperationAck(id))
-                operationRequester -= id
+                if(persistOp.get(id).map(_.isCancelled).getOrElse(false))
+                {
+                    operationRequester.get(id).map(_ ! OperationAck(id))
+                    operationRequester -= id
+                }
             }
         }
         case msg => println("Unknown message" + msg)
     }
 
-    def acknowledgement(id: Long) =
+    private def acknowledgement(id: Long) =
     {
         println(s"ackn id: $id")
         println(s"persistOp: ${persistOp.contains(id)}")
-        println(s"repl set size: ${replicationSet.size}")
+        println(s"repl set size: ${repAckn.size}")
         persistOp.get(id).map(_.cancel())
         updateOp.get(id).map{c =>
             c.cancel()
-            if(replicationSet.isEmpty)
+            if(repAckn.isEmpty)
             {
                 operationRequester.get(id).map(_ ! OperationAck(id))
                 operationRequester -= id
@@ -177,13 +188,13 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
         }
     }
 
-    def opProcessing(id: Long, key: String, value: Option[String], requester: ActorRef) =
+    private def opProcessing(id: Long, key: String, value: Option[String], requester: ActorRef) =
     {
         operationRequester += id -> requester
         operations += id -> (key, value, false)
         replicators.foreach{ replicator =>
             replicator ! Replicate(key, value, id)
-            replicationSet += replicator
+            repAckn = addToReplAckn(repAckn, replicator, id)
         }
         val persOp = context.system.scheduler.schedule(0 millis, 100 millis){persistence ! Persist(key, value, id)}
         val op = context.system.scheduler.scheduleOnce(1 second){
@@ -197,6 +208,16 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
         }
         updateOp += id -> op
         persistOp += id -> persOp
+    }
+
+    private def addToReplAckn(m: Map[ActorRef, Set[Long]], k: ActorRef, v: Long) =
+    {
+        m.get(k).fold(m.updated(k, Set(v)))(f => m.updated(k, f + v))
+    }
+
+    private def rmFromReplAckn(m: Map[ActorRef, Set[Long]], k: ActorRef, v: Long) =
+    {
+        m.get(k).fold(m)(f => if((f - v).isEmpty) m - k else m.updated(k, f - v))
     }
 
     /* TODO Behavior for the replica role. */
