@@ -48,10 +48,12 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
      */
 
     var updateOp: Map[Long, Cancellable] = Map.empty[Long, Cancellable]
+
     var persistOp: Map[Long, Cancellable] = Map.empty[Long, Cancellable]
+
     var replicateOp: Map[Long, Cancellable] = Map.empty[Long, Cancellable]
 
-    var operations: Map[Long, (String, Option[String], Boolean)] = Map.empty[Long, (String, Option[String], Boolean)]
+    var operations: Map[Long, (String, Option[String])] = Map.empty[Long, (String, Option[String])]
 
     var operationRequester: Map[Long, ActorRef] = Map.empty[Long, ActorRef]
 
@@ -64,8 +66,6 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     var secondaries = Map.empty[ActorRef, ActorRef]
     // the current set of replicators
     var replicators = Set.empty[ActorRef]
-
-    var replicationSet = Set.empty[ActorRef]
 
     var repAckn: Map[ActorRef, Set[Long]] = Map.empty[ActorRef, Set[Long]]
 
@@ -86,22 +86,14 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
     /* TODO Behavior for  the leader role. */
     val leader: Receive = {
-        case ins@Insert(key, value, id) =>
-        {
-            opProcessing(id, key, Some(value), sender)
-        }
-        case rm@Remove(key, id) =>
-        {
-            opProcessing(id, key, None, sender)
-        }
-        case get@Get(key, id) =>
-        {
-            sender ! GetResult(key, kv.get(key), id)
-        }
-        case Persisted(key, id) =>
-        {
-            acknowledgement(id)
-        }
+        case ins@Insert(key, value, id) => opProcessing(id, key, Some(value), sender)
+
+        case rm@Remove(key, id) => opProcessing(id, key, None, sender)
+
+        case get@Get(key, id) => sender ! GetResult(key, kv.get(key), id)
+
+        case Persisted(key, id) => acknowledgement(id)
+
         case Replicas(replicas) =>
         {
 
@@ -109,21 +101,14 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
             val replicasToUpdate = replicas diff secondariesReplicasSet
             val replicasToRemove = secondariesReplicasSet diff replicas
             val replicatorsToRemove = secondaries.filter(el => replicasToRemove.contains(el._1)).toSet[(ActorRef, ActorRef)].map(v => v._2)
+
             replicasToRemove.foreach(_ ! PoisonPill)
             replicatorsToRemove.foreach(_ ! PoisonPill)
-//            replicationSet = replicationSet -- replicatorsToRemove
+
             replicatorsToRemove.foreach(replicator => repAckn -= replicator)
 
             replicasToRemove.foreach(secondaries -= _)
             replicatorsToRemove.foreach(replicators -= _)
-
-            /*if(replicas.size == 1 && replicas.head == self)
-            {
-                replicateOp.foreach{case (k, c) =>
-                    c.cancel()
-                    acknowledgement(k)
-                }
-            }*/
 
             if(secondaries.size == 0 && (replicasToUpdate - self).isEmpty)
             {
@@ -132,12 +117,12 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
                    acknowledgement(k)
                }
             }
-
             (replicasToUpdate - self).foreach{ replica =>
-                val replicator = context.system.actorOf(Replicator.props(replica))
+                val replicator = context.system.actorOf(Replicator.props(replica)) // создаем репликаторы для новых реплик
                 secondaries += replica -> replicator
                 replicators += replicator
-                kv foreach{ case (k, v) =>
+                // запускаем репликацию сущ. данных в новые реплики
+                kv.foreach{ case (k, v) =>
                     val doomyId = Random.nextLong * 1000L
                     replicator ! Replicate(k, Some(v), doomyId)
                         repAckn = addToReplAckn(repAckn, replicator, doomyId)
@@ -165,11 +150,9 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
     private def acknowledgement(id: Long) =
     {
-        println(s"ackn id: $id")
-        println(s"persistOp: ${persistOp.contains(id)}")
-        println(s"repl set size: ${repAckn.size}")
         persistOp.get(id).map(_.cancel())
-        updateOp.get(id).map{c =>
+        updateOp.get(id).map
+        {c =>
             c.cancel()
             if(repAckn.isEmpty)
             {
@@ -178,25 +161,26 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
             }
             operations.get(id) match
             {
-                case Some((key, Some(v), _)) =>
-                    kv += key -> v
-                case Some((key, None, _)) =>
-                    kv -= key
+                case Some((key, Some(v))) => kv += key -> v
+                case Some((key, None)) => kv -= key
                 case None => println("Oooops, operations is empty!")
             }
-/*            operations -= id*/
         }
     }
 
     private def opProcessing(id: Long, key: String, value: Option[String], requester: ActorRef) =
     {
         operationRequester += id -> requester
-        operations += id -> (key, value, false)
+        operations += id -> (key, value)
+
         replicators.foreach{ replicator =>
             replicator ! Replicate(key, value, id)
             repAckn = addToReplAckn(repAckn, replicator, id)
         }
+        //шедьюлим перситенс
         val persOp = context.system.scheduler.schedule(0 millis, 100 millis){persistence ! Persist(key, value, id)}
+
+        // таймаут на операцию
         val op = context.system.scheduler.scheduleOnce(1 second){
             requester ! OperationFailed(id)
             updateOp -= id
@@ -204,6 +188,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
             operations -= id
         }
         if(replicators.nonEmpty){
+            //таймаут на репликацию
             replicateOp += id -> context.system.scheduler.scheduleOnce(1 second){println(s"replic timeot id: $id!");requester ! OperationFailed(id)}
         }
         updateOp += id -> op
@@ -232,6 +217,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
                 sender ! SnapshotAck(key, seq)
             else if(seq == expectedSeq && seqToReplicator.get(seq).isEmpty)
             {
+                // здесь нужно обновлять значение не дожидаясь подтверждения персистенса
                 valueOpt match
                 {
                     case Some(v) => kv += key -> v
@@ -241,20 +227,16 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
                 opProcessing(seq, key, valueOpt, self)
             }
         }
-        case Persisted(key, id) =>
-        {
-            acknowledgement(id)
-        }
+        case Persisted(key, id) => acknowledgement(id)
+
         case OperationAck(id) =>
         {
-            operations.get(id).map{ case(k: String, v: Option[String], _) => seqToReplicator.get(id).map(_ ! SnapshotAck(k, id))}
+            operations.get(id).map{ case(k: String, v: Option[String]) => seqToReplicator.get(id).map(_ ! SnapshotAck(k, id))}
             seqToReplicator -= id
             if(expectedSeq < id +1) expectedSeq += 1
         }
-        case OperationFailed(id) =>
-        {
-            println(s"Secondary replica op: $id persistent failed!")
-        }
+        case OperationFailed(id) =>println(s"Secondary replica op: $id persistent failed!")
+
         case _ =>
     }
 
